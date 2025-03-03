@@ -1,0 +1,145 @@
+import sys
+import subprocess
+import traceback
+import os
+import numpy as np
+import pandas as pd
+import joblib
+import glob
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance, partial_dependence
+from captum.attr import IntegratedGradients
+from alibi.explainers import Counterfactual
+import dice_ml
+from joblib import Parallel, delayed
+import shap
+from lime import lime_tabular
+from mpl_toolkits.mplot3d import Axes3D
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Enable debugging
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Install necessary packages
+required_packages = [
+    'shap==0.41.0', 'lime', 'scikit-learn==1.2.2', 'matplotlib', 'seaborn', 'numpy', 'pandas', 'joblib', 'tqdm',
+    'torch', 'captum', 'alibi', 'dice-ml'
+]
+
+for package in required_packages:
+    try:
+        package_name = package.split('==')[0]
+        __import__(package_name)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Fix numpy.bool issue
+if not hasattr(np, 'bool'):
+    np.bool = np.bool_
+
+# Data paths
+output_dir = "/content/drive/My Drive/XEIFloodingSP/Results/XAI_Analysis/Custom_XAI"
+data_path = "/content/drive/My Drive/XEIFloodingSP/Results/XAI_Analysis/Corrigido/cleaned_data.pkl"
+model_dir = "/content/drive/My Drive/XEIFloodingSP/Results/steps/"
+os.makedirs(output_dir, exist_ok=True)
+
+# Load data
+logger.info("Loading data...")
+tqdm.write("📥 Loading data...")
+cleaned_data = joblib.load(data_path)
+X_train = np.maximum(cleaned_data["X_train"], 0)
+y_train = cleaned_data["y_train_binary"]
+X_test = np.maximum(cleaned_data["X_test"], 0)
+y_test = cleaned_data["y_test_binary"]
+feature_names = cleaned_data["feature_names"]
+
+# Find the latest model file
+model_files = glob.glob(model_dir + "best_model_*.pkl")
+if model_files:
+    model_path = max(model_files, key=os.path.getctime)  # Get the most recent model
+    logger.info(f"Loading model: {model_path}")
+    tqdm.write(f"📥 Loading model: {model_path}")
+    rf_model = joblib.load(model_path)
+else:
+    logger.error("❌ No model file found!")
+    sys.exit("Model file not found")
+
+# Feature importance
+logger.info("Computing feature importance...")
+tqdm.write("📊 Computing feature importance...")
+perm_importance = permutation_importance(rf_model, X_test, y_test, n_repeats=10, random_state=42)
+feature_importance = pd.DataFrame({
+    'feature': feature_names,
+    'importance_mean': np.nan_to_num(perm_importance.importances_mean),
+    'importance_std': np.nan_to_num(perm_importance.importances_std)
+}).sort_values('importance_mean', ascending=False)
+feature_importance.to_csv(f"{output_dir}/feature_importance.csv", index=False)
+
+# LIME Analysis
+def compute_lime(feature_names, num_samples=500):
+    lime_explainer = lime_tabular.LimeTabularExplainer(
+        X_train, feature_names=feature_names, class_names=['No Flood', 'Flood'], mode='classification'
+    )
+    idx = np.random.randint(0, X_test.shape[0])
+    lime_exp = lime_explainer.explain_instance(X_test[idx], rf_model.predict_proba, num_features=10)
+    lime_exp.save_to_file(f"{output_dir}/lime_explanation.html")
+    return lime_exp
+
+logger.info("Computing LIME explanations...")
+tqdm.write("📊 Computing LIME explanations...")
+compute_lime(feature_names)
+
+# SHAP Analysis
+logger.info("Performing SHAP analysis...")
+tqdm.write("🔍 Performing SHAP analysis...")
+X_test_sample = shap.sample(X_test, 500)
+explainer = shap.TreeExplainer(rf_model)
+shap_values = explainer.shap_values(X_test_sample)
+
+# Ensure 5 classes are represented
+num_classes = len(shap_values) if isinstance(shap_values, list) else 1
+print(f"Número de classes no modelo: {num_classes}")
+
+# SHAP Summary Plot
+logger.info("🔍 Generating SHAP summary plot...")
+tqdm.write("🔍 Generating SHAP summary plot...")
+plt.figure(figsize=(10, 8))
+shap.summary_plot(shap_values, X_test_sample, feature_names=feature_names, show=True)
+plt.savefig(f"{output_dir}/shap_summary.png", dpi=300)
+plt.show()
+
+# SHAP Waterfall Plot
+logger.info("🔍 Generating SHAP waterfall plot...")
+tqdm.write("🔍 Generating SHAP waterfall plot...")
+idx = np.random.randint(0, X_test_sample.shape[0])
+
+if isinstance(shap_values, list):
+    for class_idx in range(num_classes):
+        plt.figure(figsize=(10, 8))
+        shap.waterfall_plot(shap.Explanation(
+            values=shap_values[class_idx][idx],
+            base_values=explainer.expected_value[class_idx],
+            data=X_test_sample[idx],
+            feature_names=feature_names
+        ))
+        plt.savefig(f"{output_dir}/shap_waterfall_plot_class_{class_idx}.png", dpi=300)
+        plt.show()
+else:
+    plt.figure(figsize=(10, 8))
+    shap.waterfall_plot(shap.Explanation(
+        values=shap_values[idx],
+        base_values=explainer.expected_value,
+        data=X_test_sample[idx],
+        feature_names=feature_names
+    ))
+    plt.savefig(f"{output_dir}/shap_waterfall_plot.png", dpi=300)
+    plt.show()
+
+logger.info(f"✅ Analysis completed! Results in: {output_dir}")
+tqdm.write(f"✅ Analysis completed! Results in: {output_dir}")
